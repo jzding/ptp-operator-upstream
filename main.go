@@ -46,10 +46,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	// OpenShift TLS profile support
+	configv1 "github.com/openshift/api/config/v1"
+
 	ptpv1 "github.com/k8snetworkplumbingwg/ptp-operator/api/v1"
 	ptpv2alpha1 "github.com/k8snetworkplumbingwg/ptp-operator/api/v2alpha1"
 	"github.com/k8snetworkplumbingwg/ptp-operator/controllers"
 	"github.com/k8snetworkplumbingwg/ptp-operator/pkg/leaderelection"
+	"github.com/k8snetworkplumbingwg/ptp-operator/pkg/tlsprofile"
 	corev1 "k8s.io/api/core/v1"
 	//+kubebuilder:scaffold:imports
 )
@@ -63,6 +67,8 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(ptpv1.AddToScheme(scheme))
 	utilruntime.Must(ptpv2alpha1.AddToScheme(scheme))
+	// Add OpenShift config types to scheme for TLS profile support
+	utilruntime.Must(configv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -82,6 +88,33 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 	le := leaderelection.GetLeaderElectionConfig(restConfig, enableLeaderElection)
 
+	// Create cancellable context for graceful shutdown on TLS profile changes
+	ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer cancel()
+
+	// Create temporary client to fetch TLS profile before manager starts
+	tempClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "unable to create temporary client for TLS profile fetch")
+		os.Exit(1)
+	}
+
+	// Fetch TLS profile from APIServer CR (returns default Intermediate if not set)
+	tlsProfileSpec, err := tlsprofile.FetchAPIServerTLSProfile(ctx, tempClient)
+	if err != nil {
+		setupLog.Error(err, "unable to fetch TLS security profile from APIServer CR")
+		os.Exit(1)
+	}
+	setupLog.Info("fetched TLS security profile", "minTLSVersion", tlsProfileSpec.MinTLSVersion)
+
+	// Convert TLS profile to Go crypto/tls configuration
+	tlsOpts, unsupportedCiphers := tlsprofile.NewTLSConfigFromProfile(tlsProfileSpec)
+	if len(unsupportedCiphers) > 0 {
+		setupLog.Info("some ciphers from TLS profile are not supported in Go crypto/tls",
+			"unsupportedCiphers", unsupportedCiphers)
+	}
+
+	// Combine HTTP/2 control with TLS profile configuration
 	disableHTTP2 := func(c *tls.Config) {
 		if enableHTTP2 {
 			return
@@ -89,8 +122,14 @@ func main() {
 		c.NextProtos = []string{"http/1.1"}
 	}
 
+	// Combine TLS configuration functions
+	combinedTLSOpts := func(c *tls.Config) {
+		tlsOpts(c)      // Apply cluster TLS profile
+		disableHTTP2(c) // Apply HTTP/2 settings
+	}
+
 	webhookServerOptions := webhook.Options{
-		TLSOpts: []func(config *tls.Config){disableHTTP2},
+		TLSOpts: []func(config *tls.Config){combinedTLSOpts},
 		Port:    9443,
 	}
 
@@ -192,6 +231,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Set up TLS profile watcher - triggers graceful shutdown on profile changes
+	watcher := &tlsprofile.TLSProfileWatcher{
+		Client:                mgr.GetClient(),
+		InitialTLSProfileSpec: tlsProfileSpec,
+		OnProfileChange: func(ctx context.Context, old, new *configv1.TLSProfileSpec) {
+			setupLog.Info("TLS security profile changed, triggering graceful shutdown",
+				"oldMinTLSVersion", old.MinTLSVersion,
+				"newMinTLSVersion", new.MinTLSVersion)
+			// Cancel context to trigger graceful shutdown
+			// Operator will restart and pick up new TLS configuration
+			cancel()
+		},
+	}
+	if err := watcher.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up TLS profile watcher")
+		os.Exit(1)
+	}
+
 	checker := mgr.GetWebhookServer().StartedChecker()
 	//+kubebuilder:scaffold:builder
 
@@ -219,7 +276,7 @@ func main() {
 		}
 	}()
 	setupLog.Info("starting manager")
-	if err = mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err = mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

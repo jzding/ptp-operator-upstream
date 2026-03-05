@@ -100,6 +100,8 @@ tags
 ### VisualStudioCode ###
 .vscode/*
 .history
+# Claude Code
+.claude
 # Generated files
 test/conformance/parallel/linuxptp-daemon-*
 # End of https://www.gitignore.io/api/go,vim,emacs,visualstudiocode
