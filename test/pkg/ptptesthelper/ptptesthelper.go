@@ -219,10 +219,7 @@ func CreatePtpTestPrivilegedDaemonSet(daemonsetName, daemonsetNamespace, daemons
 	memReq := "100M"
 	var env []corev1.EnvVar
 	daemonSetRunningPods, err := k8sPriviledgedDs.CreateDaemonSet(daemonsetName, daemonsetNamespace, daemonsetContainerName, imageWithVersion, dummyLabels, env, pkg.TimeoutIn5Minutes, cpuReq, cpuLim, memReq, memLim)
-
-	if err != nil {
-		logrus.Errorf("error : +%v\n", err.Error())
-	}
+	Expect(err).NotTo(HaveOccurred(), "failed to create privileged daemonset %s/%s", daemonsetNamespace, daemonsetName)
 	return daemonSetRunningPods
 }
 
